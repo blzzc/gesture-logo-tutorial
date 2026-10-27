@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gesture Logo</title>
+  </head>
+
+  <body>
+    <h1>Gesture Logo</h1>
+
+    <button id="start">开启摄像头</button>
+    <p id="status">等待开启</p>
+
+    <video
+      id="camera"
+      autoplay
+      playsinline
+      muted
+      width="640"
+      style="max-width: 100%; transform: scaleX(-1)"
+    ></video>
+
+    <canvas
+      id="scene"
+      width="640"
+      height="400"
+      style="max-width: 100%"
+    ></canvas>
+
+    <script type="module">
+      import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+      import * as THREE from "three";
+
+      const canvas = document.querySelector("#scene");
+
+      // 场景：放置物体的空间
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color("#171923");
+
+      // 相机：决定我们从哪里看
+      const camera = new THREE.PerspectiveCamera(45, 640 / 400, 0.1, 100);
+      camera.position.z = 4;
+
+      // 渲染器：把场景画到 canvas 上
+      const renderer = new THREE.WebGLRenderer({
+        canvas,
+        antialias: true,
+      });
+      renderer.setSize(640, 400);
+
+      // 立方体：形状 + 材质
+      const geometry = new THREE.BoxGeometry(1, 1, 1);
+      const material = new THREE.MeshNormalMaterial();
+      const cube = new THREE.Mesh(geometry, material);
+
+      cube.rotation.x = 0.4;
+      scene.add(cube);
+
+      const button = document.querySelector("#start");
+      const video = document.querySelector("#camera");
+      const status = document.querySelector("#status");
+
+      let handLandmarker;
+      let lastVideoTime = -1;
+
+      let previousX = null;
+      let previousDragTime = null;
+      let isDragging = false;
+
+      let angularVelocity = 0; // 旋转速度，单位：弧度/秒
+      const sensitivity = Math.PI * 2;
+      const damping = 3; // 越大，松手后停得越快
+
+      // 每帧渲染；松手后根据当前角速度实现惯性旋转
+      let lastFrameTime = null;
+
+      renderer.setAnimationLoop((time) => {
+        if (lastFrameTime === null) {
+          lastFrameTime = time;
+        }
+
+        const dt = Math.min((time - lastFrameTime) / 1000, 0.05);
+        lastFrameTime = time;
+
+        if (!isDragging) {
+          const decay = Math.exp(-damping * dt);
+          cube.rotation.y += angularVelocity * (1 - decay) / damping;
+          angularVelocity *= decay;
+
+          if (Math.abs(angularVelocity) < 0.01) {
+            angularVelocity = 0;
+          }
+        }
+
+        renderer.render(scene, camera);
+      });
+
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+
+        try {
+          status.textContent = "正在加载手部识别模型……";
+
+          const vision = await FilesetResolver.forVisionTasks(`${import.meta.env.BASE_URL}wasm`);
+
+          handLandmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: `${import.meta.env.BASE_URL}models/hand_landmarker.task`,
+            },
+            runningMode: "VIDEO",
+            numHands: 2,
+          });
+
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: false,
+          });
+
+          video.srcObject = stream;
+          await video.play();
+
+          lastVideoTime = -1;
+          detectHands();
+        } catch (error) {
+          status.textContent = `启动失败：${error.message}`;
+          button.disabled = false;
+        }
+      });
+
+      function detectHands() {
+        try {
+          if (
+            video.readyState >= 2 &&
+            video.currentTime !== lastVideoTime
+          ) {
+            lastVideoTime = video.currentTime;
+
+            const result = handLandmarker.detectForVideo(
+              video,
+              performance.now()
+            );
+
+            if (result.landmarks.length > 0) {
+              const hand = result.landmarks[0];
+              const thumb = hand[4];
+              const index = hand[8];
+
+              const dx = (thumb.x - index.x) * video.videoWidth;
+              const dy = (thumb.y - index.y) * video.videoHeight;
+              const distance = Math.hypot(dx, dy);
+
+              const palmWidth = Math.hypot(
+                (hand[5].x - hand[17].x) * video.videoWidth,
+                (hand[5].y - hand[17].y) * video.videoHeight
+              );
+
+              const ratio = distance / Math.max(palmWidth, 1);
+              const isPinching = ratio < 0.3;
+
+              const currentX = 1 - index.x;
+              const now = performance.now() / 1000;
+
+              if (isPinching) {
+                // 刚捏住：停止原有惯性，准备重新拖动
+                if (!isDragging) {
+                  angularVelocity = 0;
+                }
+
+                if (previousX !== null && previousDragTime !== null) {
+                  const dt = now - previousDragTime;
+
+                  if (dt > 0 && dt < 0.2) {
+                    const deltaAngle = (currentX - previousX) * sensitivity;
+
+                    // 拖多少，就转多少
+                    cube.rotation.y += deltaAngle;
+
+                    // 估计速度，并稍微平滑，减少识别抖动
+                    const measuredVelocity = deltaAngle / dt;
+                    const blend = 1 - Math.exp(-15 * dt);
+
+                    angularVelocity +=
+                      (measuredVelocity - angularVelocity) * blend;
+                  } else {
+                    angularVelocity = 0;
+                  }
+                }
+
+                isDragging = true;
+                previousX = currentX;
+                previousDragTime = now;
+              } else {
+                // 检测到手，但已经松开：保留惯性
+                isDragging = false;
+                previousX = null;
+                previousDragTime = null;
+              }
+
+              status.textContent = isPinching
+                ? "捏合中：可以控制模型"
+                : "已松开：惯性旋转";
+            } else {
+              // 没检测到手：清除拖动状态并停止
+              isDragging = false;
+              previousX = null;
+              previousDragTime = null;
+              angularVelocity = 0;
+
+              status.textContent = "没有检测到手";
+            }
+          }
+
+          requestAnimationFrame(detectHands);
+        } catch (error) {
+          status.textContent = `识别失败：${error.message}`;
+          console.error(error);
+        }
+      }
+    </script>
+  </body>
+</html>
